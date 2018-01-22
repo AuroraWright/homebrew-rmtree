@@ -133,7 +133,7 @@ module BrewRmtree
               Requirement.prune if ignores.any? { |ignore| req.send(ignore) } && !dependent.build.with?(req)
             end
             deps.any? { |dep| dep.to_formula.full_name == ff.full_name rescue dep.name == ff.name } ||
-              reqs.any? { |req| req.name == ff.name || [ff.name, ff.full_name].include?(req.default_formula) }
+              reqs.any? { |req| req.name == ff.name }
           else
             deps = f.deps.reject do |dep|
               ignores.any? { |ignore| dep.send(ignore) }
@@ -142,7 +142,7 @@ module BrewRmtree
               ignores.any? { |ignore| req.send(ignore) }
             end
             deps.any? { |dep| dep.to_formula.full_name == ff.full_name rescue dep.name == ff.name } ||
-              reqs.any? { |req| req.name == ff.name || [ff.name, ff.full_name].include?(req.default_formula) }
+              reqs.any? { |req| req.name == ff.name }
           end
         rescue FormulaUnavailableError
           # Silently ignore this case as we don't care about things used in
@@ -173,11 +173,7 @@ module BrewRmtree
       return Formulary.factory(keg_name.name)
     end
     if keg_name.is_a? Requirement
-      if keg_name.to_dependency
-        return Formulary.factory(keg_name.to_dependency.name)
-      else
-        return nil
-      end
+      return nil
     end
     return Formulary.factory(keg_name)
   end

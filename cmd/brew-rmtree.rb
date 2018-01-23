@@ -382,6 +382,8 @@ module BrewRmtree
         else break
     end; }
 
+    ARGV[0] = "--include-optional"
+
     # Turn off output if 'quiet' is specified
     if quiet
       puts_off

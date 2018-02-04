@@ -351,6 +351,8 @@ module BrewRmtree
     # Confirm with user packages that can and will be removed
     describe_build_tree_will_remove(wont_remove_because)
 
+    ARGV.shift
+
     should_proceed_or_quit("Proceed?")
 
     ohai "Cleaning up packages safe to remove"

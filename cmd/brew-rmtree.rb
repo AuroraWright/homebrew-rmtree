@@ -104,12 +104,17 @@ module BrewRmtree
   end
 
   # Remove a particular keg
-  def remove_keg(keg_name)
+  def remove_keg(keg_name, dry_run)
+    if dry_run
+      puts "Would have removed #{keg_name}"
+      return
+    end
+
     # Remove old versions of keg
     puts bash "brew cleanup #{keg_name}"
 
     # Remove current keg
-    puts bash "brew uninstall --ignore-dependencies #{keg_name}"
+    puts bash "brew uninstall #{keg_name}"
   end
 
   # A list of dependencies of keg_name that are still installed after removal
@@ -127,26 +132,65 @@ module BrewRmtree
         begin
           if recursive
             deps = f.recursive_dependencies do |dependent, dep|
-              Dependency.prune if ignores.any? { |ignore| dep.send(ignore) } && !dependent.build.with?(dep)
+              if dep.recommended?
+                Dependency.prune if ignores.include?("recommended?") || dependent.build.without?(dep)
+              elsif dep.optional?
+                Dependency.prune if !includes.include?("optional?") && !dependent.build.with?(dep)
+              elsif dep.build?
+                Dependency.prune unless includes.include?("build?")
+              end
+
+              # If a tap isn't installed, we can't find the dependencies of one
+              # its formulae, and an exception will be thrown if we try.
+              if dep.is_a?(TapDependency) && !dep.tap.installed?
+                Dependency.keep_but_prune_recursive_deps
+              end
             end
-            reqs = f.recursive_requirements do |dependent, req|
-              Requirement.prune if ignores.any? { |ignore| req.send(ignore) } && !dependent.build.with?(req)
+
+            dep_formulae = deps.flat_map do |dep|
+              begin
+                dep.to_formula
+              rescue
+                []
+              end
             end
-            deps.any? { |dep| dep.to_formula.full_name == ff.full_name rescue dep.name == ff.name } ||
-              reqs.any? { |req| req.name == ff.name }
+
+            reqs_by_formula = ([f] + dep_formulae).flat_map do |formula|
+              formula.requirements.map { |req| [formula, req] }
+            end
+
+            reqs_by_formula.reject! do |dependent, req|
+              if req.recommended?
+                ignores.include?("recommended?") || dependent.build.without?(req)
+              elsif req.optional?
+                !includes.include?("optional?") && !dependent.build.with?(req)
+              elsif req.build?
+                !includes.include?("build?")
+              end
+            end
+
+            reqs = reqs_by_formula.map(&:last)
           else
             deps = f.deps.reject do |dep|
-              ignores.any? { |ignore| dep.send(ignore) }
+              ignores.any? { |ignore| dep.send(ignore) } && includes.none? { |include| dep.send(include) }
             end
             reqs = f.requirements.reject do |req|
-              ignores.any? { |ignore| req.send(ignore) }
+              ignores.any? { |ignore| req.send(ignore) } && includes.none? { |include| req.send(include) }
             end
-            deps.any? { |dep| dep.to_formula.full_name == ff.full_name rescue dep.name == ff.name } ||
-              reqs.any? { |req| req.name == ff.name }
           end
+          next true if deps.any? do |dep|
+            begin
+              dep.to_formula.full_name == ff.full_name
+            rescue
+              dep.name == ff.name
+            end
+          end
+
+          reqs.any? { |req| req.name == ff.name }
         rescue FormulaUnavailableError
           # Silently ignore this case as we don't care about things used in
           # taps that aren't currently tapped.
+          next
         end
       end
     end
@@ -173,7 +217,11 @@ module BrewRmtree
       return Formulary.factory(keg_name.name)
     end
     if keg_name.is_a? Requirement
-      return nil
+      begin
+        return Formulary.factory(keg_name.to_dependency.name)
+      rescue
+        return nil
+      end
     end
     return Formulary.factory(keg_name)
   end
@@ -232,7 +280,7 @@ module BrewRmtree
 
   # Simple prompt helper
   def should_proceed(prompt)
-    input = [(print "#{prompt}[y/N]: "), gets.rstrip][1]
+    input = [(print "#{prompt}[y/N]: "), STDIN.gets.chomp()][1]
     if ['y', 'yes'].include?(input.downcase)
       return true
     end
@@ -322,6 +370,33 @@ module BrewRmtree
     return wont_remove_because
   end
 
+  def order_to_be_removed_v2(start_from, wont_remove_because)
+    # Maintain stuff we delete
+    deleted_formulae = [start_from]
+
+    # Stuff we *should* be able to delete, albeit using faulty logic from before
+    maybe_dependencies_to_delete = removable_in_tree(wont_remove_because).map { |d,_| d }
+
+    # Keep deleting things that we *think* we can delete. As we go through the list,
+    # more things should become deletable. But when no new things become deletable,
+    # then we are done. This is hacky logic v2
+    last_size = 0
+    while maybe_dependencies_to_delete.size != last_size
+      last_size = maybe_dependencies_to_delete.size
+      maybe_dependencies_to_delete.each do |dep|
+        _used_by = uses(dep, false).to_set.subtract(deleted_formulae.to_set)
+        # puts "Deleted formulae are #{deleted_formulae.inspect()}"
+        # puts "#{dep} is used by #{_used_by.inspect()}"
+        if _used_by.size == 0
+          deleted_formulae << dep
+          maybe_dependencies_to_delete.delete dep
+        end
+      end
+    end
+
+    return deleted_formulae, maybe_dependencies_to_delete
+  end
+
   def rmtree(keg_name, force=false, ignored_kegs=[])
     # Does anything use keg such that we can't remove it?
     if !force
@@ -342,24 +417,53 @@ module BrewRmtree
     # Dependency list of what can be removed, and what can't, and why
     wont_remove_because = build_tree(keg_name, ignored_kegs)
 
+    kegs_to_delete_in_order, maybe_dependencies_to_delete = order_to_be_removed_v2(keg_name, wont_remove_because)
+
     # Dry run print out more information on what will happen
     if @dry_run
-      describe_build_tree(wont_remove_because)
-      return
+      # describe_build_tree(wont_remove_because)
+
+      puts ""
+      puts "Can safely be removed"
+      puts "----------------------"
+      kegs_to_delete_in_order.each do |k|
+        puts k
+      end
+      
+      describe_build_tree_wont_remove(wont_remove_because)
+      if @dry_run
+        maybe_dependencies_to_delete.each do |dep|
+          _used_by = uses(dep, false).to_set.subtract(kegs_to_delete_in_order)
+          puts "#{dep} is used by #{_used_by.to_a.join(', ')}"
+        end
+      end
+
+      puts ""
+      puts "Order of operations"
+      puts "-------------------"
+      puts kegs_to_delete_in_order
+    else
+      # Confirm with user packages that can and will be removed
+      # describe_build_tree_will_remove(wont_remove_because)
+
+      puts ""
+      puts "Can safely be removed"
+      puts "----------------------"
+      kegs_to_delete_in_order.each do |k|
+        puts k
+      end
+
+      ARGV.shift
+
+      should_proceed_or_quit("Proceed?")
+
+      ohai "Cleaning up packages safe to remove"
     end
 
-    # Confirm with user packages that can and will be removed
-    describe_build_tree_will_remove(wont_remove_because)
-
-    ARGV.shift
-
-    should_proceed_or_quit("Proceed?")
-
-    ohai "Cleaning up packages safe to remove"
-
     # Remove packages
-    remove_keg(keg_name)
-    removable_in_tree(wont_remove_because).map { |d,_| remove_keg(d) }
+    # remove_keg(keg_name, @dry_run)
+    #removable_in_tree(wont_remove_because).map { |d,_| remove_keg(d, @dry_run) }
+    kegs_to_delete_in_order.each { |d| remove_keg(d, @dry_run) }
   end
 
   def main
